@@ -236,6 +236,11 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
         t.exec("create unique index on " + converter.schema_name + R"(.fill_status ((true)))");
         t.exec("insert into " + converter.schema_name + R"(.fill_status values (0, '', 0, '', 0))");
 
+        t.exec("create table " + converter.schema_name + 
+            R"(.account_history ("account" varchar(64), "act_global_seq" bigint, "block_num" bigint, "transaction_ordinal" int4, "action_ordinal" int4, "act_account" varchar(64), "act_name" varchar(64)))");
+        t.exec("create unique index on " + converter.schema_name + R"(.account_history ("account", "act_global_seq"))");
+        t.exec("create index account_history_block_num_idx on " + converter.schema_name + R"(.account_history ("block_num"))");
+
         auto exec = [&t](const auto& stmt) { t.exec(stmt); };
         converter.create_table("block_info", get_type("signed_block_header"), "block_num bigint, block_id varchar(64)", {"block_num"}, exec);
 
@@ -412,6 +417,7 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
             pipeline.insert(query);
         };
         trunc("received_block");
+        trunc("account_history");
         trunc("transaction_trace");
         trunc("block_info");
         for (auto& table : connection->abi.tables) {
@@ -622,6 +628,27 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
         }
     }
 
+    void write_action_trace(
+        uint32_t block_num, uint32_t transaction_ordinal, const action_trace& at
+    ) {
+        std::visit([this, block_num, transaction_ordinal](auto&& at) {
+            if (!at.receipt) return;
+
+            std::set<eosio::name> aset;
+            aset.insert(at.receiver);
+            for (const auto& a : at.act.authorization) {
+                aset.insert(a.actor);
+            }
+
+            auto action_sequence_num = std::visit([](auto&& receipt) { return receipt.global_sequence; }, *at.receipt);
+            // auto action_sequence_num = std::get_if<action_receipt_v0>(at.receipt.value()).global_sequence;
+            for (auto name : aset) {
+                std::vector<std::string> values{sql_str(name), sql_str(action_sequence_num), sql_str(block_num), sql_str(transaction_ordinal), sql_str(at.action_ordinal), sql_str(at.act.account), sql_str(at.act.name)};
+                write_stream(block_num, "account_history", values);
+            }
+        }, at);
+    }
+
     void write_transaction_trace(
         uint32_t block_num, uint32_t& num_ordinals, const eosio::ship_protocol::transaction_trace& trace, eosio::input_stream trace_bin) {
 
@@ -638,6 +665,11 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
         std::vector<std::string> values{std::to_string(block_num), std::to_string(transaction_ordinal)};
         converter.to_sql_values(trace_bin, "transaction_trace", *get_type("transaction_trace").as_variant(), values);
         write_stream(block_num, "transaction_trace", values);
+
+        auto action_traces = std::visit([](auto&& ttrace) { return ttrace.action_traces; }, trace);
+        for (auto& atrace : action_traces) {
+            write_action_trace(block_num, transaction_ordinal, atrace);
+        }
     } // write_transaction_trace
 
     void trim() {
